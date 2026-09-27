@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Comment, EditConflict, Paragraph, Reply, Role, Version } from '../types'
+import type { Comment, EditConflict, HistorySnapshot, Paragraph, Reply, ReviewBatch, Role, Version } from '../types'
 
 const DRAFT_KEY = 'sologsb-1002-draft-v1'
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -22,31 +22,57 @@ const baseComments: Comment[] = [
   { id: 'c-06', paragraphId: 'p-06', author: '审稿人 B', role: 'reviewer', type: 'suggestion', quote: '但没有显著降低维护者处理复杂议题的认知负担', body: '“显著”需要给出统计检验与效应量。', suggestion: '初步结果显示，辅助工具缩短了首次响应时间，但对复杂议题处理时长与自我报告认知负担均未产生统计显著影响。', status: 'open', replies: [], createdAt: Date.now() - 36000000 },
 ]
 const seed = typeof localStorage !== 'undefined' ? localStorage.getItem(DRAFT_KEY) : null
-const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }> : null
+const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[]; batches: ReviewBatch[] }> : null
 const initialParagraphs = parsed?.paragraphs?.length ? parsed.paragraphs : baseParagraphs
 const initialComments = parsed?.comments ?? baseComments
 const initialVersions: Version[] = parsed?.versions ?? [
   { id: 'v-01', label: '投稿初稿 v1', createdAt: Date.now() - 1209600000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs)) as Paragraph[] },
   { id: 'v-02', label: '审阅基线 v2', createdAt: Date.now() - 172800000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs.map((p) => p.id === 'p-04' ? { ...p, text: `${p.text} 编码规则在预注册方案中说明。` } : p))) as Paragraph[] },
 ]
+const initialBatches: ReviewBatch[] = parsed?.batches ?? []
 
-const persistDraft = (paragraphs: Paragraph[], comments: Comment[], versions: Version[]) => {
-  localStorage.setItem(DRAFT_KEY, JSON.stringify({ paragraphs, comments, versions }))
+const persistDraft = (paragraphs: Paragraph[], comments: Comment[], versions: Version[], batches: ReviewBatch[]) => {
+  localStorage.setItem(DRAFT_KEY, JSON.stringify({ paragraphs, comments, versions, batches }))
 }
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+const activeDraftBatch = (batches: ReviewBatch[]) => batches.find((batch) => batch.status === 'draft')
+
+/**
+ * 批次进行中，凡锚定文字与当前正文不一致的待处理意见一律标为过时：
+ * 批次开始时纳入的意见锚定到批次基线，批次进行中新增的意见锚定到提交时文字。
+ */
+const markOutdated = (comments: Comment[], paragraphs: Paragraph[], batch: ReviewBatch | undefined): Comment[] => {
+  if (!batch) return comments
+  return comments.map((comment) => {
+    if (comment.batchId !== batch.id || comment.status !== 'open') return comment
+    const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+    const anchor = comment.anchoredText ?? batch.paragraphBaselines[comment.paragraphId]
+    if (paragraph && anchor !== undefined && paragraph.text !== anchor) {
+      return { ...comment, status: 'outdated' as const, outdatedAt: Date.now() }
+    }
+    return comment
+  })
+}
+
+export interface CloseBatchResult {
+  ok: boolean
+  pending: Comment[]
+  versionLabel?: string
+}
 
 interface ReviewState {
   role: Role
   paragraphs: Paragraph[]
   comments: Comment[]
   versions: Version[]
+  batches: ReviewBatch[]
   selectedParagraphId: string
   commentFilter: 'all' | 'open' | 'suggestion' | 'duplicate'
   revisionMode: boolean
   dirty: boolean
   conflicts: EditConflict[]
-  past: { paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }[]
-  future: { paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }[]
+  past: HistorySnapshot[]
+  future: HistorySnapshot[]
   setRole: (role: Role) => void
   selectParagraph: (id: string) => void
   setCommentFilter: (filter: ReviewState['commentFilter']) => void
@@ -56,8 +82,13 @@ interface ReviewState {
   replyComment: (commentId: string, body: string) => void
   resolveSuggestion: (commentId: string, accepted: boolean) => void
   mergeComment: (commentId: string, targetId: string) => void
+  resolveComment: (commentId: string) => void
   toggleLock: (paragraphId: string) => void
   createVersion: (label: string) => void
+  startBatch: (label: string) => void
+  closeBatch: () => CloseBatchResult
+  confirmComment: (commentId: string, patch: { quote?: string; suggestion?: string }) => void
+  withdrawComment: (commentId: string) => void
   addConflict: (conflict: EditConflict) => void
   resolveConflict: (conflictId: string, strategy: 'local' | 'remote') => void
   dismissConflict: (conflictId: string) => void
@@ -69,12 +100,13 @@ interface ReviewState {
 
 export const useReviewStore = create<ReviewState>((set, get) => {
   const record = (producer: (state: ReviewState) => Partial<ReviewState>) => set((state) => {
-    const history = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions) }
+    const history: HistorySnapshot = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions), batches: clone(state.batches) }
     const next = producer(state)
     const paragraphs = next.paragraphs ?? state.paragraphs
     const comments = next.comments ?? state.comments
     const versions = next.versions ?? state.versions
-    persistDraft(paragraphs, comments, versions)
+    const batches = next.batches ?? state.batches
+    persistDraft(paragraphs, comments, versions, batches)
     return { ...next, past: [...state.past.slice(-49), history], future: [], dirty: true }
   })
 
@@ -83,6 +115,7 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     paragraphs: initialParagraphs,
     comments: initialComments,
     versions: initialVersions,
+    batches: initialBatches,
     selectedParagraphId: 'p-02',
     commentFilter: 'all',
     revisionMode: false,
@@ -94,13 +127,16 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     selectParagraph: (selectedParagraphId) => set({ selectedParagraphId }),
     setCommentFilter: (commentFilter) => set({ commentFilter }),
     setRevisionMode: (revisionMode) => set({ revisionMode }),
-    updateParagraph: (paragraphId, text) => record((state) => ({
-      paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
+    updateParagraph: (paragraphId, text) => record((state) => {
+      const paragraphs = state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
         ? { ...paragraph, text, status: 'open' as const, highlighted: true }
-        : paragraph),
-    })),
-    addComment: (input) => record((state) => ({
-      comments: [{
+        : paragraph)
+      return { paragraphs, comments: markOutdated(state.comments, paragraphs, activeDraftBatch(state.batches)) }
+    }),
+    addComment: (input) => record((state) => {
+      const batch = activeDraftBatch(state.batches)
+      const paragraph = state.paragraphs.find((item) => item.id === input.paragraphId)
+      const comment: Comment = {
         ...input,
         id: id('comment'),
         author: state.role === 'reviewer' ? '审稿人 A' : state.role === 'author' ? '作者' : '编辑',
@@ -108,8 +144,17 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         status: 'open',
         replies: [],
         createdAt: Date.now(),
-      }, ...state.comments],
-    })),
+        // 审稿人在批次进行中新增的批注与建议归入当前批次，并锚定提交时的段落文字
+        batchId: batch?.id,
+        anchoredText: batch ? paragraph?.text : undefined,
+      }
+      return {
+        comments: [comment, ...state.comments],
+        batches: batch
+          ? state.batches.map((item) => item.id === batch.id ? { ...item, commentIds: [...item.commentIds, comment.id] } : item)
+          : state.batches,
+      }
+    }),
     replyComment: (commentId, body) => record((state) => ({
       comments: state.comments.map((comment) => comment.id === commentId ? {
         ...comment,
@@ -118,15 +163,26 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     })),
     resolveSuggestion: (commentId, accepted) => record((state) => {
       const comment = state.comments.find((item) => item.id === commentId)
+      const paragraphs = comment?.suggestion && accepted
+        ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' as const } : paragraph)
+        : state.paragraphs
       return {
-        comments: state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item),
-        paragraphs: comment?.suggestion && accepted
-          ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' } : paragraph)
-          : state.paragraphs,
+        comments: markOutdated(
+          state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' as const : 'rejected' as const } : item),
+          paragraphs,
+          activeDraftBatch(state.batches),
+        ),
+        paragraphs,
       }
     }),
     mergeComment: (commentId, targetId) => record((state) => ({
       comments: state.comments.map((comment) => comment.id === commentId ? { ...comment, status: 'merged', mergedInto: targetId } : comment),
+    })),
+    // 编辑把普通批注标记为已处理（已在正文中落实），用于批次结项前清结意见
+    resolveComment: (commentId) => record((state) => ({
+      comments: state.comments.map((comment) => comment.id === commentId && comment.status === 'open'
+        ? { ...comment, status: 'accepted' as const }
+        : comment),
     })),
     toggleLock: (paragraphId) => record((state) => ({
       paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId ? {
@@ -137,13 +193,76 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     createVersion: (label) => record((state) => ({
       versions: [{ id: id('version'), label: label.trim() || `版本 ${state.versions.length + 1}`, createdAt: Date.now(), paragraphs: clone(state.paragraphs) }, ...state.versions],
     })),
+    startBatch: (label) => {
+      const state = get()
+      if (activeDraftBatch(state.batches)) return
+      const batch: ReviewBatch = {
+        id: id('batch'),
+        label: label.trim() || `审阅批次 ${state.batches.length + 1}`,
+        status: 'draft',
+        startedAt: Date.now(),
+        // 开始时记下各段文字和全部待处理意见
+        paragraphBaselines: Object.fromEntries(state.paragraphs.map((paragraph) => [paragraph.id, paragraph.text])),
+        commentIds: state.comments.filter((comment) => comment.status === 'open').map((comment) => comment.id),
+      }
+      record(() => ({
+        batches: [batch, ...state.batches],
+        comments: state.comments.map((comment) => comment.status === 'open' ? { ...comment, batchId: batch.id } : comment),
+      }))
+    },
+    closeBatch: () => {
+      const state = get()
+      const batch = activeDraftBatch(state.batches)
+      if (!batch) return { ok: false, pending: [] }
+      const pending = state.comments.filter((comment) => comment.batchId === batch.id && (comment.status === 'open' || comment.status === 'outdated'))
+      // 意见都处理完（含过时意见已确认或撤回）才能结束
+      if (pending.length) return { ok: false, pending }
+      const version: Version = {
+        id: id('version'),
+        label: `${batch.label} · 结项版本`,
+        createdAt: Date.now(),
+        paragraphs: clone(state.paragraphs),
+        batchId: batch.id,
+      }
+      record(() => ({
+        versions: [version, ...state.versions],
+        batches: state.batches.map((item) => item.id === batch.id
+          ? { ...item, status: 'closed' as const, closedAt: Date.now(), versionId: version.id }
+          : item),
+      }))
+      return { ok: true, pending: [], versionLabel: version.label }
+    },
+    // 审稿人按新文字确认过时意见：重新锚定到当前正文，可同步修订引用与建议
+    confirmComment: (commentId, patch) => record((state) => ({
+      comments: state.comments.map((comment) => {
+        if (comment.id !== commentId || comment.status !== 'outdated') return comment
+        const currentText = state.paragraphs.find((paragraph) => paragraph.id === comment.paragraphId)?.text
+        return {
+          ...comment,
+          status: 'open' as const,
+          outdatedAt: undefined,
+          quote: patch.quote ?? comment.quote,
+          suggestion: patch.suggestion !== undefined ? patch.suggestion : comment.suggestion,
+          anchoredText: currentText ?? comment.anchoredText,
+        }
+      }),
+    })),
+    // 审稿人撤回过时意见，视为已处理
+    withdrawComment: (commentId) => record((state) => ({
+      comments: state.comments.map((comment) => comment.id === commentId && comment.status === 'outdated'
+        ? { ...comment, status: 'withdrawn' as const }
+        : comment),
+    })),
     addConflict: (conflict) => set((state) => ({ conflicts: [conflict, ...state.conflicts] })),
     resolveConflict: (conflictId, strategy) => record((state) => {
       const conflict = state.conflicts.find((item) => item.id === conflictId)
+      const paragraphs = conflict && strategy === 'remote'
+        ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
+        : state.paragraphs
       return {
-        paragraphs: conflict && strategy === 'remote'
-          ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
-          : state.paragraphs,
+        paragraphs,
+        // 采用远端文字同样会使旧文字上的意见过时
+        comments: markOutdated(state.comments, paragraphs, activeDraftBatch(state.batches)),
         conflicts: state.conflicts.filter((item) => item.id !== conflictId),
       }
     }),
@@ -151,25 +270,25 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     undo: () => set((state) => {
       const previous = state.past.at(-1)
       if (!previous) return state
-      const current = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions) }
-      persistDraft(previous.paragraphs, previous.comments, previous.versions)
+      const current: HistorySnapshot = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions), batches: clone(state.batches) }
+      persistDraft(previous.paragraphs, previous.comments, previous.versions, previous.batches)
       return { ...previous, past: state.past.slice(0, -1), future: [current, ...state.future], dirty: true }
     }),
     redo: () => set((state) => {
       const next = state.future[0]
       if (!next) return state
-      const current = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions) }
-      persistDraft(next.paragraphs, next.comments, next.versions)
+      const current: HistorySnapshot = { paragraphs: clone(state.paragraphs), comments: clone(state.comments), versions: clone(state.versions), batches: clone(state.batches) }
+      persistDraft(next.paragraphs, next.comments, next.versions, next.batches)
       return { ...next, past: [...state.past, current], future: state.future.slice(1), dirty: true }
     }),
     save: () => {
-      persistDraft(get().paragraphs, get().comments, get().versions)
+      persistDraft(get().paragraphs, get().comments, get().versions, get().batches)
       set({ dirty: false })
     },
     resetDemo: () => {
       localStorage.removeItem(DRAFT_KEY)
-      set({ paragraphs: clone(baseParagraphs), comments: clone(baseComments), versions: clone(initialVersions), conflicts: [], past: [], future: [], dirty: false })
-      persistDraft(baseParagraphs, baseComments, initialVersions)
+      set({ paragraphs: clone(baseParagraphs), comments: clone(baseComments), versions: clone(initialVersions), batches: [], conflicts: [], past: [], future: [], dirty: false })
+      persistDraft(baseParagraphs, baseComments, initialVersions, [])
     },
   }
 })

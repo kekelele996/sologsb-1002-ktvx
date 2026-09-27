@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
-  CommentOutlined, DiffOutlined, DeleteOutlined, FileDoneOutlined, FileTextOutlined,
-  HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlusOutlined,
-  RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
+  CommentOutlined, DiffOutlined, DeleteOutlined, FieldTimeOutlined, FileDoneOutlined, FileTextOutlined,
+  HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlayCircleOutlined, PlusOutlined,
+  RedoOutlined, SaveOutlined, SendOutlined, StopOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
 } from '@ant-design/icons'
-import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
+import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Progress, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
 import { submitRemotePatch } from './services/mockApi'
 import { useReviewStore } from './store/review'
 import type { Comment, CommentType, Paragraph, Role } from './types'
@@ -20,10 +20,10 @@ const formatDate = (value: number) => new Date(value).toLocaleString('zh-CN', { 
 
 export default function App() {
   const {
-    role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
+    role, paragraphs, comments, versions, batches, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
     setRole, selectParagraph, setCommentFilter, setRevisionMode, updateParagraph, addComment, replyComment,
-    resolveSuggestion, mergeComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
-    undo, redo, save, resetDemo,
+    resolveSuggestion, mergeComment, resolveComment, toggleLock, createVersion, startBatch, closeBatch, confirmComment, withdrawComment,
+    addConflict, resolveConflict, dismissConflict, undo, redo, save, resetDemo,
   } = useReviewStore()
   const [composerOpen, setComposerOpen] = useState(false)
   const [commentType, setCommentType] = useState<CommentType>('comment')
@@ -35,6 +35,10 @@ export default function App() {
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
   const [versionB, setVersionB] = useState(versions[0]?.id)
   const [versionLabel, setVersionLabel] = useState('')
+  const [batchLabel, setBatchLabel] = useState('')
+  const [confirmingComment, setConfirmingComment] = useState<Comment | null>(null)
+  const [confirmQuote, setConfirmQuote] = useState('')
+  const [confirmSuggestion, setConfirmSuggestion] = useState('')
 
   const selected = paragraphs.find((paragraph) => paragraph.id === selectedParagraphId) ?? paragraphs[0]
   const sections = useMemo(() => Array.from(new Set(paragraphs.map((paragraph) => paragraph.section))), [paragraphs])
@@ -44,11 +48,23 @@ export default function App() {
   }, {}), [comments])
   const duplicateParagraphIds = useMemo(() => new Set(Object.entries(paragraphCommentCounts).filter(([, count]) => count > 1).map(([id]) => id)), [paragraphCommentCounts])
   const visibleComments = useMemo(() => comments.filter((comment) => {
-    if (commentFilter === 'open') return comment.status === 'open'
-    if (commentFilter === 'suggestion') return comment.type === 'suggestion' && comment.status === 'open'
+    if (commentFilter === 'open') return comment.status === 'open' || comment.status === 'outdated'
+    if (commentFilter === 'suggestion') return comment.type === 'suggestion' && (comment.status === 'open' || comment.status === 'outdated')
     if (commentFilter === 'duplicate') return duplicateParagraphIds.has(comment.paragraphId) && comment.status === 'open'
     return true
   }).sort((a, b) => b.createdAt - a.createdAt), [commentFilter, comments, duplicateParagraphIds])
+
+  const activeBatch = batches.find((batch) => batch.status === 'draft')
+  const batchComments = useMemo(() => activeBatch ? comments.filter((comment) => comment.batchId === activeBatch.id) : [], [activeBatch, comments])
+  const pendingComments = useMemo(() => batchComments.filter((comment) => comment.status === 'open' || comment.status === 'outdated'), [batchComments])
+  const outdatedComments = useMemo(() => batchComments.filter((comment) => comment.status === 'outdated'), [batchComments])
+  const batchChangedParagraphIds = useMemo(() => {
+    if (!activeBatch) return new Set<string>()
+    return new Set(paragraphs
+      .filter((paragraph) => activeBatch.paragraphBaselines[paragraph.id] !== undefined && activeBatch.paragraphBaselines[paragraph.id] !== paragraph.text)
+      .map((paragraph) => paragraph.id))
+  }, [activeBatch, paragraphs])
+  const closedBatches = batches.filter((batch) => batch.status === 'closed')
 
   useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -117,6 +133,31 @@ export default function App() {
     setVersionLabel('')
     message.success('当前版本已保存')
   }
+  const handleStartBatch = () => {
+    startBatch(batchLabel)
+    setBatchLabel('')
+    message.success('审阅批次已开始：已记录各段文字与待处理意见')
+  }
+  const handleCloseBatch = () => {
+    const result = closeBatch()
+    if (result.ok) message.success(`批次已结束，正文已存为新版本「${result.versionLabel}」`)
+    else message.warning(`还有 ${result.pending.length} 条意见未处理（含 ${result.pending.filter((item) => item.status === 'outdated').length} 条过时意见），全部处理完才能结束批次`)
+  }
+  const openConfirmComment = (comment: Comment) => {
+    setConfirmingComment(comment)
+    const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+    setConfirmQuote(comment.quote)
+    setConfirmSuggestion(comment.type === 'suggestion' ? paragraph?.text ?? comment.suggestion ?? '' : comment.suggestion ?? '')
+  }
+  const submitConfirmComment = () => {
+    if (!confirmingComment) return
+    confirmComment(confirmingComment.id, {
+      quote: confirmQuote.trim() || confirmingComment.quote,
+      suggestion: confirmingComment.type === 'suggestion' ? confirmSuggestion : undefined,
+    })
+    setConfirmingComment(null)
+    message.success('审稿人已按新文字确认，意见恢复为待处理')
+  }
   const comparedA = versions.find((version) => version.id === versionA)
   const comparedB = versions.find((version) => version.id === versionB)
   const comparedRows = comparedA && comparedB ? comparedA.paragraphs.map((paragraph, index) => ({ a: paragraph, b: comparedB.paragraphs[index] })) : []
@@ -180,6 +221,58 @@ export default function App() {
               </div>
             ))}
           </nav>
+          <div className="batch-box">
+            <div className="panel-title"><FieldTimeOutlined /> 审阅批次</div>
+            {activeBatch ? (
+              <div className="batch-active">
+                <div className="batch-name">
+                  <Tag color="processing">进行中</Tag>
+                  <b title={activeBatch.label}>{activeBatch.label}</b>
+                </div>
+                <small>开始于 {formatDate(activeBatch.startedAt)}</small>
+                <Progress
+                  percent={batchComments.length ? Math.round(((batchComments.length - pendingComments.length) / batchComments.length) * 100) : 100}
+                  size="small" status={pendingComments.length ? 'active' : 'success'}
+                />
+                <div className="batch-stats">
+                  <span>纳入意见 <b>{batchComments.length}</b></span>
+                  <span>待处理 <b className={pendingComments.length ? 'warn' : ''}>{pendingComments.length}</b></span>
+                  <span>过时 <b className={outdatedComments.length ? 'danger' : ''}>{outdatedComments.length}</b></span>
+                </div>
+                {batchChangedParagraphIds.size > 0 && (
+                  <p className="batch-tip">本批次已有 {batchChangedParagraphIds.size} 段文字变化，旧文字上的建议已暂停接受。</p>
+                )}
+                {role === 'editor' ? (
+                  <Button block size="small" type="primary" icon={<StopOutlined />} onClick={handleCloseBatch}>结束批次并存为新版本</Button>
+                ) : (
+                  <p className="batch-tip">批次由编辑结束；未结束的草稿刷新后仍可继续处理。</p>
+                )}
+              </div>
+            ) : (
+              <div className="batch-idle">
+                {role === 'editor' ? (
+                  <>
+                    <Input size="small" value={batchLabel} onChange={(event) => setBatchLabel(event.target.value)} placeholder="批次名称（如外审第二轮）" onPressEnter={handleStartBatch} />
+                    <Button block size="small" icon={<PlayCircleOutlined />} onClick={handleStartBatch}>开始审阅批次</Button>
+                    <small>开始时锁定各段文字与待处理意见；批次中新增的批注建议自动归入。</small>
+                  </>
+                ) : (
+                  <small className="batch-muted">编辑尚未开始审阅批次。批次进行中，审稿人新增的批注与建议会自动归入。</small>
+                )}
+                {closedBatches.length > 0 && (
+                  <div className="batch-history">
+                    <Divider plain style={{ margin: '8px 0', fontSize: 10 }}>已结束 {closedBatches.length}</Divider>
+                    {closedBatches.map((batch) => (
+                      <div key={batch.id} className="batch-closed-item">
+                        <Tag color="default" icon={<CheckOutlined />}>已结束</Tag>
+                        <span title={batch.label}>{batch.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           <div className="version-box">
             <div className="panel-title"><HistoryOutlined /> 版本</div>
             <Input value={versionLabel} onChange={(event) => setVersionLabel(event.target.value)} placeholder="新版本名称" onPressEnter={handleCreateVersion} />
@@ -213,6 +306,7 @@ export default function App() {
                       <span>段落 {paragraph.number.replace('.', '')}</span>
                       {paragraph.status === 'locked' && <Tag icon={<LockOutlined />} color="purple">已锁定</Tag>}
                       {paragraph.status === 'accepted' && <Tag icon={<CheckOutlined />} color="green">已确认</Tag>}
+                      {activeBatch && batchChangedParagraphIds.has(paragraph.id) && <Tooltip title="该段在本批次中改动过，旧文字上的待处理建议已标为过时"><Tag icon={<FieldTimeOutlined />} color="orange">本批次已改</Tag></Tooltip>}
                       {!!paragraphCommentCounts[paragraph.id] && <Tag icon={<MessageOutlined />}>{paragraphCommentCounts[paragraph.id]} 条意见</Tag>}
                     </div>
                     {revisionMode ? (
@@ -239,7 +333,7 @@ export default function App() {
 
         <aside className="comments-panel">
           <div className="comments-header">
-            <div><h2><CommentOutlined /> 审阅意见 <Badge count={comments.filter((comment) => comment.status === 'open').length} /></h2><p>引用原文、讨论与修订建议</p></div>
+            <div><h2><CommentOutlined /> 审阅意见 <Badge count={comments.filter((comment) => comment.status === 'open' || comment.status === 'outdated').length} /></h2><p>引用原文、讨论与修订建议</p></div>
           </div>
           <div className="comment-filters">
             <Radio.Group value={commentFilter} onChange={(event) => setCommentFilter(event.target.value)} buttonStyle="solid" size="small">
@@ -250,11 +344,20 @@ export default function App() {
             {visibleComments.map((comment) => {
               const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
               return (
-                <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
+                <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag>{!!comment.batchId && <Tag color="geekblue">批次意见</Tag>}</span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
                   <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
                   <p className="comment-body">{comment.body}</p>
                   {comment.suggestion && <div className="suggestion-box"><small>建议改为</small><p>{comment.suggestion}</p></div>}
-                  {comment.status !== 'open' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : 'blue'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : '已合并'}</Tag>}
+                  {comment.status === 'outdated' && (
+                    <Alert
+                      className="outdated-alert" type="warning" showIcon
+                      message="该意见基于旧文字，已过时并暂停接受"
+                      description={role === 'reviewer'
+                        ? '段落已按新稿修改，请按新文字确认意见（可修订引用与建议）或直接撤回。'
+                        : '需等待审稿人按新文字确认或撤回后，作者才能继续处理。'}
+                    />
+                  )}
+                  {comment.status !== 'open' && comment.status !== 'outdated' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : comment.status === 'merged' ? 'blue' : 'default'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : comment.status === 'merged' ? '已合并' : '已撤回'}</Tag>}
                   <div className="replies">
                     {comment.replies.map((reply) => <div key={reply.id} className="reply"><b>{reply.author}</b><span>{reply.body}</span></div>)}
                   </div>
@@ -263,10 +366,12 @@ export default function App() {
                     <Button size="small" type="text" icon={<SendOutlined />} onClick={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
                   </div>
                   {comment.status === 'open' && role === 'author' && comment.type === 'suggestion' && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => resolveSuggestion(comment.id, true)}>接受修改</Button><Button danger size="small" icon={<CloseOutlined />} onClick={() => resolveSuggestion(comment.id, false)}>拒绝</Button></div>}
+                  {comment.status === 'outdated' && role === 'reviewer' && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => openConfirmComment(comment)}>按新文字确认</Button><Button size="small" icon={<CloseOutlined />} onClick={() => { withdrawComment(comment.id); message.success('意见已撤回') }}>撤回</Button></div>}
                   {comment.status === 'open' && role === 'editor' && duplicateParagraphIds.has(comment.paragraphId) && (() => {
                     const sibling = comments.find((item) => item.id !== comment.id && item.paragraphId === comment.paragraphId && item.status === 'open')
                     return sibling ? <Button size="small" type="dashed" icon={<BranchesOutlined />} onClick={() => mergeComment(comment.id, sibling.id)}>合并到“{sibling.author}”意见</Button> : null
                   })()}
+                  {comment.status === 'open' && role === 'editor' && <div className="decision-row"><Button size="small" icon={<CheckOutlined />} onClick={() => resolveComment(comment.id)}>标记已处理</Button></div>}
                 </Card>
               )
             })}
@@ -289,9 +394,9 @@ export default function App() {
 
       <Modal title="版本比较" open={versionOpen} onCancel={() => setVersionOpen(false)} footer={null} width={980}>
         <div className="compare-selectors">
-          <Select value={versionA} onChange={setVersionA} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}`, value: version.id }))} />
+          <Select value={versionA} onChange={setVersionA} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}${version.batchId ? ' · 批次结项' : ''}`, value: version.id }))} />
           <ArrowRightOutlined />
-          <Select value={versionB} onChange={setVersionB} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}`, value: version.id }))} />
+          <Select value={versionB} onChange={setVersionB} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}${version.batchId ? ' · 批次结项' : ''}`, value: version.id }))} />
         </div>
         <div className="version-table">
           <div className="version-head"><b>{comparedA?.label ?? '版本 A'}</b><b>{comparedB?.label ?? '版本 B'}</b></div>
@@ -301,6 +406,29 @@ export default function App() {
             </div>
           ))}
         </div>
+      </Modal>
+
+      <Modal
+        title="按新文字确认意见" open={!!confirmingComment} onCancel={() => setConfirmingComment(null)} onOk={submitConfirmComment}
+        okText="确认并恢复待处理" cancelText="取消" width={620}
+      >
+        {confirmingComment && (
+          <div className="composer">
+            <Alert type="info" showIcon message="段落文字已变化，请核对意见是否仍适用于新稿；确认后重新锚定到当前文字。" />
+            <label>新稿文字</label>
+            <div className="new-text-box">{paragraphs.find((item) => item.id === confirmingComment.paragraphId)?.text}</div>
+            <label>修订引用原文</label>
+            <Input.TextArea value={confirmQuote} onChange={(event) => setConfirmQuote(event.target.value)} autoSize={{ minRows: 1, maxRows: 3 }} />
+            {confirmingComment.type === 'suggestion' && (
+              <>
+                <label>按新文字修订建议</label>
+                <Input.TextArea value={confirmSuggestion} onChange={(event) => setConfirmSuggestion(event.target.value)} autoSize={{ minRows: 2, maxRows: 6 }} />
+              </>
+            )}
+            <label>原意见说明</label>
+            <p className="comment-body">{confirmingComment.body}</p>
+          </div>
+        )}
       </Modal>
 
       <footer className="app-footer">
